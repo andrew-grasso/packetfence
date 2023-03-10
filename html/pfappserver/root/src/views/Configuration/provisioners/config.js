@@ -8,7 +8,7 @@ export const provisioningTypes = {
   dpsk:         i18n.t('DPSK'),
   ibm:          i18n.t('IBM'),
   jamf:         i18n.t('Jamf'),
-  jamf_cloud:   i18n.t('Jamf Cloud'),
+  jamfcloud:    i18n.t('Jamf Cloud'),
   kandji:       i18n.t('Kandji'),
   mobileconfig: i18n.t('Apple Devices'),
   mobileiron:   i18n.t('Mobileiron'),

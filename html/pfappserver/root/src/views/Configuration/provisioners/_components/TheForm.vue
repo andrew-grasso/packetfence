@@ -82,7 +82,7 @@ export const setup = (props) => {
       case 'ibm':                         return FormTypeIbm //break
       case 'intune':                      return FormTypeIntune //break
       case 'jamf':                        return FormTypeJamf //break
-      case 'jamf_cloud':                  return FormTypeJamfCloud //break
+      case 'jamfcloud':                   return FormTypeJamfCloud //break
       case 'kandji':                      return FormTypeKandji //break
       case 'mobileconfig':                return FormTypeMobileconfig //break
       case 'mobileiron':                  return FormTypeMobileiron //break
