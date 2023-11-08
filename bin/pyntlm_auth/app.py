@@ -1,19 +1,26 @@
+import configparser
 import os
+import sys
+import threading
 import binascii
 
 from flask import Flask, g, request, jsonify
-
-from samba import param
+from http import HTTPStatus
+from configparser import ConfigParser
+from samba import param, NTSTATUSError, ntstatus
 from samba.dcerpc import netlogon, ntlmssp, srvsvc
 from samba.dcerpc.netlogon import (netr_Authenticator, netr_WorkstationInformation, MSV1_0_ALLOW_MSVCHAPV2)
 from samba.credentials import Credentials, DONT_USE_KERBEROS
 from samba.dcerpc.misc import SEC_CHAN_WKSTA, SEC_CHAN_DOMAIN, SEC_CHAN_BDC
 
-from configparser import ConfigParser
+machine_cred = None
+secure_channel_connection = None
+connection_id = 1
+reconnect_id = 0
+lock = threading.Lock()
 
 conf_path = os.getenv("CONF")
 listen_port = os.getenv("LISTEN")
-
 config = ConfigParser()
 try:
     with open(conf_path, 'r') as file:
@@ -32,22 +39,18 @@ try:
         domain = config.get('AD', 'domain')
     else:
         print("The specified section does not exist in the config file.")
-except FileNotFoundError:
+        sys.exit(1)
+except FileNotFoundError as e:
     print("The specified config file does not exist.")
-
+    sys.exit(1)
 except configparser.Error as e:
     print(f"Error reading config file: {e}")
-
-app = Flask(__name__)
-
-machineCred = None
-secureChannelConn = None
+    sys.exit(1)
 
 
-def initGlobalSecureConnection():
-    global machineCred
-    global secureChannelConn
-
+def init_secure_connection():
+    global machine_cred
+    global secure_channel_connection
     lp = param.LoadParm()
 
     try:
@@ -59,90 +62,159 @@ def initGlobalSecureConnection():
     lp.set('realm', realm)
     lp.set('server string', server_string)
     lp.set('workgroup', workgroup)
+    lp.set('ldap connection timeout', "2")
+    lp.set('winbind request timeout', '2')
 
-    machineCred = Credentials()
+    machine_cred = Credentials()
 
-    machineCred.guess(lp)
-    machineCred.set_secure_channel_type(SEC_CHAN_WKSTA)
-    machineCred.set_kerberos_state(DONT_USE_KERBEROS)
+    machine_cred.guess(lp)
+    machine_cred.set_secure_channel_type(SEC_CHAN_WKSTA)
+    machine_cred.set_kerberos_state(DONT_USE_KERBEROS)
 
-    machineCred.set_workstation(workstation)
-    machineCred.set_username(username)
-    machineCred.set_password(password)
+    machine_cred.set_workstation(workstation)
+    machine_cred.set_username(username)
+    machine_cred.set_password(password)
 
-    machineCred.set_password_will_be_nt_hash(True if password_is_nt_hash == "1" else False)
-    machineCred.set_domain(domain)
+    machine_cred.set_password_will_be_nt_hash(True if password_is_nt_hash == "1" else False)
+    machine_cred.set_domain(domain)
 
-    secureChannelConn = netlogon.netlogon("ncacn_np:%s[schannel,seal]" % server_name, lp, machineCred)
-    return 0
+    error_code = 0
+    error_message = ""
+    try:
+        secure_channel_connection = netlogon.netlogon("ncacn_np:%s[schannel,seal]" % server_name, lp, machine_cred)
+    except NTSTATUSError as e:
+        error_code = e.args[0]
+        error_message = e.args[1]
+        print(f"---- error in init secure connection: NT_Error, error_code={error_code}, error_message={error_message}")
 
-initGlobalSecureConnection()
+        # some common errors we already know to avoid reconnect:
+        # ntstatus.NT_STATUS_ACCESS_DENIED - usually wrong password
+        # ntstatus.NT_STATUS_NO_TRUST_SAM_ACCOUNT - machine account doesn't exist
+        # ntstatus.NT_STATUS_OBJECT_NAME_NOT_FOUND - usually AD FQDN not resolved
+        # ntstatus.NT_STATUS_NO_SUCH_DOMAIN
+        # ntstatus.NT_STATUS_NO_MEMORY (0xC0000017) - usually windows AD is shutdown
+        # ---- error in init secure connection: NT_Error, error_code=3221225653, error_message={Device Timeout} The specified I/O operation on %hs was not completed before the time-out period expired.
+    except Exception as e:
+        error_code = e.args[0]
+        error_message = e.args[1]
+        print(f"---- error in init secure connection: General, error_code={error_code}, error_message={error_message}")
+    return secure_channel_connection, machine_cred, error_code, error_message
 
 
-@app.route('/ntlm/auth', methods=['POST'])
+def get_secure_channel_connection():
+    global machine_cred
+    global secure_channel_connection
+    global connection_id
+    global reconnect_id
+    global lock
+
+    with lock:
+        if secure_channel_connection is None or machine_cred is None or (
+                reconnect_id != 0 and connection_id <= reconnect_id):
+            secure_channel_connection, machine_cred, error_code, error_message = init_secure_connection()
+            connection_id += 1
+            reconnect_id = connection_id if error_code != 0 else 0
+            return secure_channel_connection, machine_cred, connection_id, error_code, error_message
+        else:
+            return secure_channel_connection, machine_cred, connection_id, 0, ""
+
+
 def ntlm_auth_handler():
-    global secureChannelConn
-    global machineCred
+    global machine_cred
+    global secure_channel_connection
+    global connection_id
+    global reconnect_id
 
     try:
         data = request.get_json()
 
         if data is None:
-            return 'No JSON payload found in request', 400
-
+            return 'No JSON payload found in request', HTTPStatus.BAD_REQUEST
         if 'username' not in data or 'request-nt-key' not in data or 'challenge' not in data or 'nt-response' not in data:
-            return 'Invalid JSON payload format, missing required keys', 400
+            return 'Invalid JSON payload format, missing required keys', HTTPStatus.BAD_REQUEST
 
         account_username = data['username']
-        request_nt_key = data['request-nt-key']
         challenge = data['challenge']
         nt_response = data['nt-response']
 
     except Exception as e:
         print(e)
-        return "Error processing JSON payload", 500
+        return "Error processing JSON payload", HTTPStatus.INTERNAL_SERVER_ERROR
+
+    secure_channel_connection, machine_cred, connection_id, error_code, error_message = get_secure_channel_connection()
+    if error_code != 0:
+        return "Error while establishing secure channel connections: " + error_message, HTTPStatus.INTERNAL_SERVER_ERROR
+
+    with lock:
+        try:
+            auth = machine_cred.new_client_authenticator()
+        except Exception as e:
+            # usually we won't reach this if machine cred is authenticated successfully. Just in case.
+            reconnect_id = connection_id
+            return "Error in creating authenticator.", HTTPStatus.INTERNAL_SERVER_ERROR
+
+        logon_level = netlogon.NetlogonNetworkTransitiveInformation
+        validation_level = netlogon.NetlogonValidationSamInfo4
+
+        netr_flags = 0
+        current = netr_Authenticator()
+        current.cred.data = [x if isinstance(x, int) else ord(x) for x in auth["credential"]]
+        current.timestamp = auth["timestamp"]
+
+        subsequent = netr_Authenticator()
+
+        challenge = binascii.unhexlify(challenge)
+        response = binascii.unhexlify(nt_response)
+
+        logon = netlogon.netr_NetworkInfo()
+        logon.challenge = [x if isinstance(x, int) else ord(x) for x in challenge]
+        logon.nt = netlogon.netr_ChallengeResponse()
+        logon.nt.data = [x if isinstance(x, int) else ord(x) for x in response]
+        logon.nt.length = len(response)
+
+        logon.identity_info = netlogon.netr_IdentityInfo()
+        logon.identity_info.domain_name.string = domain
+        logon.identity_info.account_name.string = account_username
+        logon.identity_info.workstation.string = workstation
+
+        try:
+            result = secure_channel_connection.netr_LogonSamLogonWithFlags(server_name, workstation, current,
+                                                                           subsequent,
+                                                                           logon_level, logon, validation_level,
+                                                                           netr_flags)
+            (return_auth, info, foo, bar) = result
+
+            nt_key = [x if isinstance(x, str) else hex(x)[2:] for x in info.base.key.key]
+            nt_key_str = ''.join(nt_key)
+            nt_key_str = "NT_KEY: " + nt_key_str
+            print("---- NT KEY: ", nt_key_str)
+            return nt_key_str.encode("utf-8")
+        except NTSTATUSError as e:
+            nt_error_code = e.args[0]
+            nt_error_message = e.args[1]
+
+            if nt_error_code == ntstatus.NT_STATUS_NO_SUCH_USER:
+                return nt_error_message,HTTPStatus.NOT_FOUND
+            if nt_error_code == ntstatus.NT_STATUS_WRONG_PASSWORD:
+                return nt_error_message, HTTPStatus.UNAUTHORIZED
+            if nt_error_code == ntstatus.NT_STATUS_ACCOUNT_LOCKED_OUT:  # we should stop retrying after failures, then it will probably lock the user.
+                return nt_error_message, HTTPStatus.LOCKED
+            if nt_error_code == ntstatus.NT_STATUS_LOGIN_WKSTA_RESTRICTION:
+                return nt_error_message, HTTPStatus.UNAUTHORIZED
+            if nt_error_code == ntstatus.NT_STATUS_ACCOUNT_DISABLED:
+                return nt_error_message, HTTPStatus.UNAUTHORIZED
+
+            print("---- NT Error encountered while authenticating user: ", e)
+            reconnect_id = connection_id
+            return f"NT Error: {e}", HTTPStatus.INTERNAL_SERVER_ERROR
+        except Exception as e:
+            reconnect_id = connection_id
+            print("-----------General error:",e)
+            return "Error handling request", HTTPStatus.INTERNAL_SERVER_ERROR
 
 
-
-
-    logon_level = netlogon.NetlogonNetworkTransitiveInformation
-    validation_level = netlogon.NetlogonValidationSamInfo4
-
-    netr_flags = 0
-
-    auth = machineCred.new_client_authenticator()
-    current = netr_Authenticator()
-    current.cred.data = [x if isinstance(x, int) else ord(x) for x in auth["credential"]]
-    current.timestamp = auth["timestamp"]
-
-    subsequent = netr_Authenticator()
-
-    challenge = binascii.unhexlify(challenge)
-    response = binascii.unhexlify(nt_response)
-
-    logon = netlogon.netr_NetworkInfo()
-    logon.challenge = [x if isinstance(x, int) else ord(x) for x in challenge]
-    logon.nt = netlogon.netr_ChallengeResponse()
-    logon.nt.data = [x if isinstance(x, int) else ord(x) for x in response]
-    logon.nt.length = len(response)
-
-    logon.identity_info = netlogon.netr_IdentityInfo()
-    logon.identity_info.domain_name.string = domain
-    logon.identity_info.account_name.string = account_username
-    logon.identity_info.workstation.string = workstation
-
-    result = secureChannelConn.netr_LogonSamLogonWithFlags(server_name, workstation, current, subsequent, logon_level,
-                                                           logon, validation_level, netr_flags)
-
-    (return_auth, info, foo, bar) = result
-
-    nt_key = [x if isinstance(x, str) else hex(x)[2:] for x in info.base.key.key]
-    nt_key_str = ''.join(nt_key)
-
-    print("---- NT KEY: ", nt_key_str)
-
-    return nt_key_str.encode("utf-8")
-
+app = Flask(__name__)
+app.route('/ntlm/auth', methods=['POST'])(ntlm_auth_handler)
 # if name == __main__:
-# app.run(threaded = True, host='0.0.0.0', port=5000)
-app.run(debug='debug', processes=1, threaded=True, host='0.0.0.0', port=listen_port)
+app.run(threaded=True, host='0.0.0.0', port=int(listen_port))
+# app.run(debug='debug', processes=1, threaded=True, host='0.0.0.0', port=int(listen_port))
