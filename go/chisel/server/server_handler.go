@@ -137,11 +137,13 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	}
 	if r.Type != "config" {
 		failed(s.Errorf("expecting config request"))
+		sshConn.Close()
 		return
 	}
 	c, err := settings.DecodeConfig(r.Payload)
 	if err != nil {
 		failed(s.Errorf("invalid config"))
+		sshConn.Close()
 		return
 	}
 	//print if client and server  versions dont match
@@ -161,6 +163,7 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 			addr := r.UserAddr()
 			if !user.HasAccess(addr) {
 				failed(s.Errorf("access to '%s' denied", addr))
+				sshConn.Close()
 				return
 			}
 		}
@@ -168,11 +171,13 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 		if r.Reverse && !s.config.Reverse {
 			l.Debugf("Denied reverse port forwarding request, please enable --reverse")
 			failed(s.Errorf("Reverse port forwaring not enabled on server"))
+			sshConn.Close()
 			return
 		}
 		//confirm reverse tunnel is available
 		if r.Reverse && !r.CanListen() {
 			failed(s.Errorf("Server cannot listen on %s", r.String()))
+			sshConn.Close()
 			return
 		}
 	}
