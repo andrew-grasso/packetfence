@@ -2,16 +2,8 @@ name: packetfence-perl_debian_rhel8_package
 on:
   workflow_dispatch:
   push:
-    branches:
-      - 'maintenance/13.0'
-      - 'devel'
-      - 'features/inv-73-reusable'
   schedule:
     - cron: 0 3 * * *
-  pull_request:
-    branches: [ "devel" ]
-    paths:
-      - 'addons/packetfence-perl/**'
 
 env:
   WORKDIR: "/root"
@@ -20,29 +12,11 @@ env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   PACKAGE_NAME: 'packetfence-perl'
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  pre_job:
-    runs-on: packetfence-perl-package-build
-    outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
-    steps:
-      - id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
-        with:
-          concurrent_skipping: 'same_content_newer'
-          skip_after_successful_duplicate: 'false'
-
-
   build_prepation:
     permissions:
       pull-requests: read
     runs-on: packetfence-perl-package-build
-    if: ${{ needs.pre_job.outputs.should_skip != 'true' }} 
-    needs: pre_job
     outputs:
       volume_mount: ${{ steps.variable.outputs.volume_mount }}
       workdir: ${{ steps.variable.outputs.workdir }}
@@ -69,11 +43,11 @@ jobs:
               - 'containers/packetfence-perl/rhel8/**'
               - 'containers/packetfence-perl/debian/**'
       - run:  | 
-          echo ${{ needs.pre_job.outputs.should_skip }}
           echo ${{ steps.filters.outputs.src }}
           echo ${{ steps.filters.outputs.changes }}
           echo ${{ steps.filters.conclusion }}
           echo ${{ steps.filters.outcome }}
+          echo ${{env.BRANCH_NAME}}
 
       - name: Declare 'needs' variable
         id: variable
@@ -85,12 +59,12 @@ jobs:
           echo "package_name=${{env.PACKAGE_NAME}}" >> "$GITHUB_OUTPUT"
 
   build_images_and_packages:
-    if: ${{ needs.pre_job.outputs.should_skip != 'true' && (needs.build_prepation.outputs.path_changes == 'true' ||  contains( github.event.head_commit.message, '[perl]')) }}
+    if: ${{ contains( github.event.head_commit.message, '[perl]') || needs.build_prepation.outputs.path_changes == 'true' && ( needs.build_prepation.outputs.branch_name == 'devel' || needs.build_prepation.outputs.branch_name == 'maintenance/13.0' ) }}
     strategy:
       matrix:
         images: ['debian', 'rhel8']
     uses:  ./.github/workflows/packetfence-perl_build_image_package.yml
-    needs: ['build_prepation', 'pre_job']
+    needs: ['build_prepation']
     with:
       _IMAGE_TYPE: ${{ matrix.images }}
       _WORKDIR:  ${{needs.build_prepation.outputs.workdir}}
